@@ -15,9 +15,10 @@
  *   - streams PCM via a pool of isochronous OUT transfers, kept continuously
  *     fed from a PCM FIFO that the playback task fills (silence on underrun).
  *
- * The connected device's endpoint is assumed synchronous (no feedback EP); we
- * send the nominal 48 kHz data rate. Sample-rate is the compile-time
- * the device-supported rate (44.1 kHz preferred, else e.g. 48 kHz with
+ * Explicit-feedback asynchronous sinks report their consumption rate over
+ * an isochronous IN endpoint; packet sizing follows that fractional rate.
+ * The nominal sample rate is device-supported (44.1 kHz preferred, else
+ * e.g. 48 kHz with
  * on-board resampling — some dongles are 48 k-only).
  *
  * FULL-DUPLEX (USB_HOST_FULL_DUPLEX): some headsets — notably the Apple USB-C
@@ -110,6 +111,7 @@
 #define NUM_URBS        4
 #define PACKETS_PER_URB 8 /* 8 ms per URB; 32 ms of transfers in flight */
 #define NUM_IN_URBS     2 /* mic-IN capture pool (full-duplex un-gate) */
+#define NUM_FEEDBACK_URBS 2
 
 /* Open the mic-IN stream together with the speaker-OUT stream. Set to 0 to
  * stream output only (plain USB DAC, or to A/B-test the un-gate effect). */
@@ -155,8 +157,13 @@ static uint16_t s_out_mps = 0;
  * ~10th, averaging 44.1k. */
 static int s_frame_bytes = 4;  /* bytes per audio frame (16-bit stereo) */
 static int s_pkt_base = 0;     /* floor samples/frame = OUTPUT_RATE/1000 */
-static int s_pkt_frac = 0;     /* OUTPUT_RATE % 1000 */
-static int s_frac_accum = 0;   /* fractional-sample accumulator */
+static uint32_t s_frac_accum_q16 = 0;
+static uint32_t s_packet_rate_q16 = 0; /* samples per 1 ms USB frame */
+/* Completion timestamp and sequence protect a live FIFO/URB depth snapshot.
+ * The low 32 timestamp bits are enough: callbacks are milliseconds apart,
+ * and unsigned subtraction remains valid across the ~71 minute wrap. */
+static uint32_t s_out_timing_seq = 0;
+static uint32_t s_last_out_done_us = 0;
 static uint8_t s_ac_iface = 0; /* AudioControl interface (for class requests) */
 static uint8_t s_clock_id = 0; /* UAC2 Clock Source entity ID (0 = none/UAC1) */
 static uint8_t s_fu_ids[8];    /* Feature Unit IDs found in the AC interface */
@@ -174,6 +181,14 @@ static int s_out_subslot =
 static uint32_t s_out_rate =
     OUTPUT_RATE;              /* rate the chosen alt actually runs */
 static uint8_t s_uac_ver = 0; /* UAC spec major version: 1 or 2 */
+static bool s_out_async = false;
+static uint8_t s_feedback_ep = 0;
+static uint16_t s_feedback_mps = 0;
+static uint32_t s_feedback_interval_ms = 1;
+static usb_transfer_t *s_feedback_urb[NUM_FEEDBACK_URBS];
+static volatile bool s_feedback_active = false;
+static uint32_t s_feedback_count = 0, s_feedback_errors = 0;
+static int64_t s_feedback_filtered_q24 = 0;
 
 /* Full-duplex capture path (mic IN). Opening it alongside the speaker OUT can
  * un-gate a headset that only routes USB audio during an active bidirectional
@@ -260,7 +275,7 @@ static void fifo_reset(void) {
       vTaskDelay(1);
   }
   xStreamBufferReset(s_pcm);
-  s_fifo_hold = false;
+  /* Keep the reader held until silence prefill is complete as well. */
 }
 
 /* Refill the FIFO with silence after a reset. Starting from an EMPTY FIFO,
@@ -274,12 +289,21 @@ static void fifo_prefill_silence(void) {
     return;
   static const uint8_t zeros[512] = {0};
   size_t space = xStreamBufferSpacesAvailable(s_pcm);
-  while (space >= sizeof(zeros)) {
-    xStreamBufferSend(s_pcm, zeros, sizeof(zeros), 0);
-    space -= sizeof(zeros);
+  /* The byte capacity was sized for 16-bit stereo. For a packed 24-bit
+   * stereo sink it leaves two extra bytes; filling those bytes shifts every
+   * subsequent PCM frame and produces continuous full-scale noise. */
+  space -= space % (size_t)s_frame_bytes;
+  size_t prefill = space;
+  size_t chunk = sizeof(zeros) - sizeof(zeros) % (size_t)s_frame_bytes;
+  while (space >= chunk) {
+    xStreamBufferSend(s_pcm, zeros, chunk, 0);
+    space -= chunk;
   }
   if (space)
     xStreamBufferSend(s_pcm, zeros, space, 0);
+  s_fifo_hold = false;
+  ESP_LOGI(TAG, "FIFO prefill=%u bytes, frame=%d bytes",
+           (unsigned)prefill, s_frame_bytes);
 }
 
 /* Enqueue, blocking (paced by the consumer) until there is room. A long stall
@@ -317,7 +341,14 @@ static void fifo_pop_padded(uint8_t *dst, size_t len) {
     s_iso_cb_gen++;
     return;
   }
-  size_t got = xStreamBufferReceive(s_pcm, dst, len, 0);
+  /* A producer timeout can expose only part of a frame. Leave those bytes
+   * queued until the rest arrives, rather than inserting silence inside a
+   * packed sample and shifting the next packet's channel/sample boundary. */
+  size_t ready = xStreamBufferBytesAvailable(s_pcm);
+  if (ready > len)
+    ready = len;
+  ready -= ready % (size_t)s_frame_bytes;
+  size_t got = ready ? xStreamBufferReceive(s_pcm, dst, ready, 0) : 0;
   if (got < len) {
     memset(dst + got, 0, len - got);
     /* A PARTIAL pop is the moment an active stream ran dry — an audible
@@ -380,6 +411,10 @@ static bool find_speaker_altsetting(const usb_config_desc_t *cfg) {
   s_uac_ver = 0;
   s_out_subslot = 2;
   s_out_rate = OUTPUT_RATE;
+  s_out_async = false;
+  s_feedback_ep = 0;
+  s_feedback_mps = 0;
+  s_feedback_interval_ms = 1;
   s_clock_id = 0;
   s_clock_count = 0;
   s_fu_count = 0;
@@ -398,8 +433,11 @@ static bool find_speaker_altsetting(const usb_config_desc_t *cfg) {
 
   while (p + 2 <= end) {
     uint8_t len = p[0], type = p[1];
-    if (len < 2 || p + len > end)
+    if (len < 2 || p + len > end) {
+      ESP_LOGW(TAG, "Invalid descriptor at offset=%u length=%u total=%u",
+               (unsigned)(p - (const uint8_t *)cfg), len, cfg->wTotalLength);
       break;
+    }
 
     if (type == 0x04) { /* INTERFACE */
       iface = p[2];
@@ -543,10 +581,23 @@ static bool find_speaker_altsetting(const usb_config_desc_t *cfg) {
             s_out_mps = mps;
             s_out_subslot = as_subslot;
             s_out_rate = alt_rate;
+            s_out_async = ((ep_attr >> 2) & 0x03) == 1;
+            s_feedback_ep = 0;
+            s_feedback_mps = 0;
             found_speaker = true;
             best_rank = rank;
           }
-        } else if (!is_out && as_channels >= 1 && as_subslot == 2 &&
+        } else if (!is_out && ((ep_attr >> 4) & 0x03) == 1 &&
+                   iface == s_out_iface && alt == s_out_alt && s_out_async &&
+                   mps >= 3 && mps <= 4) {
+          s_feedback_ep = ep_addr;
+          s_feedback_mps = mps;
+          s_feedback_interval_ms = (p[6] >= 1 && p[6] <= 6)
+                                       ? 1U << (p[6] - 1) : 1;
+          ESP_LOGI(TAG, "Feedback ep=0x%02x mps=%u interval=%lums",
+                   ep_addr, mps, (unsigned long)s_feedback_interval_ms);
+        } else if (!is_out && ((ep_attr >> 4) & 0x03) == 0 &&
+                   as_channels >= 1 && as_subslot == 2 &&
                    s_in_ep == 0) {
           /* 16-bit iso IN = the mic capture path (opened for full-duplex) */
           s_in_iface = (uint8_t)iface;
@@ -583,17 +634,15 @@ static int fill_out_packets(usb_transfer_t *xfer) {
    * averages out; a fundamentally-too-small EP degrades gracefully. */
   int max_samples = (int)(s_out_mps / (uint16_t)s_frame_bytes);
   int total = 0;
+  uint32_t rate_q16 = s_packet_rate_q16;
   for (int j = 0; j < PACKETS_PER_URB; j++) {
-    int samples = s_pkt_base;
-    s_frac_accum += s_pkt_frac;
-    if (s_frac_accum >= 1000) {
-      samples++;
-      s_frac_accum -= 1000;
-    }
+    s_frac_accum_q16 += rate_q16;
+    int samples = (int)(s_frac_accum_q16 >> 16);
+    s_frac_accum_q16 &= 0xffffU;
     if (samples > max_samples) {
-      s_frac_accum += (samples - max_samples) * 1000;
-      if (s_frac_accum > 2000)
-        s_frac_accum = 2000; /* cap the debt: the EP can't sustain the rate */
+      s_frac_accum_q16 += (uint32_t)(samples - max_samples) << 16;
+      if (s_frac_accum_q16 > (2U << 16))
+        s_frac_accum_q16 = 2U << 16;
       samples = max_samples;
     }
     int bytes = samples * s_frame_bytes;
@@ -607,6 +656,7 @@ static int fill_out_packets(usb_transfer_t *xfer) {
 static void out_xfer_cb(usb_transfer_t *xfer) {
   if (!s_streaming)
     return; /* tearing down — do not resubmit */
+  uint32_t completed_us = (uint32_t)esp_timer_get_time();
   s_xfer_done++;
   if (xfer->status != USB_TRANSFER_STATUS_COMPLETED)
     s_xfer_err++;
@@ -614,8 +664,14 @@ static void out_xfer_cb(usb_transfer_t *xfer) {
     if (xfer->isoc_packet_desc[j].status != USB_TRANSFER_STATUS_COMPLETED)
       s_pkt_err++;
 
+  __atomic_fetch_add(&s_out_timing_seq, 1, __ATOMIC_ACQ_REL);
   int total = fill_out_packets(xfer); /* fractional sizing + xfer->num_bytes */
   fifo_pop_padded(xfer->data_buffer, (size_t)total);
+  /* Requeue before logging, and publish the completion together with the
+   * FIFO drain. A reader must not combine the old depth with a new timestamp. */
+  esp_err_t e = usb_host_transfer_submit(xfer);
+  __atomic_store_n(&s_last_out_done_us, completed_us, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&s_out_timing_seq, 1, __ATOMIC_RELEASE);
 
   if ((s_xfer_done % 1250) == 0) { /* ~ every 10 s (1250 urbs * 8 ms) */
     /* rx/gap deltas answer "did every UDP packet arrive in time": gap counts
@@ -634,11 +690,18 @@ static void out_xfer_cb(usb_transfer_t *xfer) {
              (unsigned long)s_pkt_err, (unsigned long)s_push_bytes,
              fifo_level(), FIFO_TARGET_BYTES, (unsigned long)s_underruns,
              (unsigned long)rx_d, (unsigned long)gap_d);
+    if (s_feedback_active) {
+      uint64_t hz_q16 = (uint64_t)s_packet_rate_q16 * 1000U;
+      ESP_LOGI(TAG, "feedback=%lu.%03lu Hz reports=%lu errors=%lu",
+               (unsigned long)(hz_q16 >> 16),
+               (unsigned long)(((hz_q16 & 0xffffU) * 1000U) >> 16),
+               (unsigned long)s_feedback_count,
+               (unsigned long)s_feedback_errors);
+    }
   }
 
   /* Resubmit regardless of transient status so the iso stream keeps flowing;
    * a real disconnect arrives via the DEV_GONE client event. */
-  esp_err_t e = usb_host_transfer_submit(xfer);
   if (e != ESP_OK && (s_xfer_done % 1250) == 0)
     ESP_LOGW(TAG, "resubmit iso OUT: %s", esp_err_to_name(e));
 }
@@ -649,9 +712,13 @@ static esp_err_t start_streaming(void) {
    * sample/packet), capped at the endpoint MPS. */
   s_frame_bytes = 2 * s_out_subslot; /* 4 = 16-bit, 6 = 24-bit (stereo) */
   s_pkt_base = (int)(s_out_rate / 1000);
-  s_pkt_frac = (int)(s_out_rate % 1000);
-  s_frac_accum = 0;
-  int alloc = (s_pkt_base + 1) * s_frame_bytes * PACKETS_PER_URB;
+  s_packet_rate_q16 = (uint32_t)(((uint64_t)s_out_rate << 16) / 1000U);
+  s_frac_accum_q16 = 0;
+  s_feedback_filtered_q24 = (int64_t)s_packet_rate_q16 << 8;
+  s_feedback_count = 0;
+  s_feedback_errors = 0;
+  __atomic_store_n(&s_out_timing_seq, 0, __ATOMIC_RELEASE);
+  int alloc = (s_pkt_base + 2) * s_frame_bytes * PACKETS_PER_URB;
   if (alloc > (int)s_out_mps * PACKETS_PER_URB)
     alloc = (int)s_out_mps * PACKETS_PER_URB;
 
@@ -685,6 +752,70 @@ static esp_err_t start_streaming(void) {
       "Streaming: ep=0x%02x rate=%lu (%d+frac samp/frame) x %d pkt x %d urbs",
       s_out_ep, (unsigned long)s_out_rate, s_pkt_base, PACKETS_PER_URB,
       NUM_URBS);
+  return ESP_OK;
+}
+
+/* UAC1 full-speed feedback is 3-byte 10.14 samples/frame; UAC2 uses
+ * 4-byte 16.16. Preserve fractions instead of rounding to whole Hz. */
+static void feedback_xfer_cb(usb_transfer_t *xfer) {
+  if (!s_feedback_active || !s_streaming)
+    return;
+  const usb_isoc_packet_desc_t *packet = &xfer->isoc_packet_desc[0];
+  if (xfer->status == USB_TRANSFER_STATUS_COMPLETED &&
+      packet->status == USB_TRANSFER_STATUS_COMPLETED &&
+      packet->actual_num_bytes >= 3) {
+    const uint8_t *p = xfer->data_buffer;
+    uint32_t value = (uint32_t)p[0] | (uint32_t)p[1] << 8 |
+                     (uint32_t)p[2] << 16;
+    if (packet->actual_num_bytes >= 4)
+      value |= (uint32_t)p[3] << 24;
+    else
+      value <<= 2;
+    uint32_t nominal = (uint32_t)(((uint64_t)s_out_rate << 16) / 1000U);
+    if (value >= nominal - (1U << 16) &&
+        value <= nominal + (1U << 16)) {
+      int64_t target_q24 = (int64_t)value << 8;
+      if (s_feedback_count == 0)
+        s_feedback_filtered_q24 = target_q24;
+      else
+        s_feedback_filtered_q24 +=
+            (target_q24 - s_feedback_filtered_q24) / 8;
+      s_packet_rate_q16 = (uint32_t)(s_feedback_filtered_q24 >> 8);
+      s_feedback_count++;
+    }
+  } else if (xfer->status != USB_TRANSFER_STATUS_COMPLETED) {
+    s_feedback_errors++;
+  }
+  xfer->num_bytes = s_feedback_mps;
+  xfer->isoc_packet_desc[0].num_bytes = s_feedback_mps;
+  if (usb_host_transfer_submit(xfer) != ESP_OK)
+    s_feedback_errors++;
+}
+
+static esp_err_t start_feedback(void) {
+  if (!s_feedback_ep)
+    return ESP_OK;
+  for (int i = 0; i < NUM_FEEDBACK_URBS; i++) {
+    ESP_RETURN_ON_ERROR(usb_host_transfer_alloc(s_feedback_mps, 1,
+                                               &s_feedback_urb[i]), TAG,
+                        "feedback allocation");
+    usb_transfer_t *xfer = s_feedback_urb[i];
+    xfer->device_handle = s_dev;
+    xfer->bEndpointAddress = s_feedback_ep;
+    xfer->callback = feedback_xfer_cb;
+    xfer->num_bytes = s_feedback_mps;
+    xfer->isoc_packet_desc[0].num_bytes = s_feedback_mps;
+  }
+  s_feedback_active = true;
+  for (int i = 0; i < NUM_FEEDBACK_URBS; i++) {
+    esp_err_t error = usb_host_transfer_submit(s_feedback_urb[i]);
+    if (error != ESP_OK) {
+      s_feedback_active = false;
+      return error;
+    }
+  }
+  ESP_LOGI(TAG, "Asynchronous rate feedback started on ep=0x%02x",
+           s_feedback_ep);
   return ESP_OK;
 }
 
@@ -1035,6 +1166,15 @@ static void setup_device(uint8_t addr) {
     ESP_LOGE(TAG, "get_active_config_descriptor failed");
     goto fail_close;
   }
+  const usb_device_desc_t *device_desc = NULL;
+  if (usb_host_get_device_descriptor(s_dev, &device_desc) == ESP_OK &&
+      device_desc) {
+    ESP_LOGI(TAG, "USB device VID=%04x PID=%04x configurations=%u",
+             device_desc->idVendor, device_desc->idProduct,
+             device_desc->bNumConfigurations);
+  }
+  ESP_LOGI(TAG, "Active configuration=%u interfaces=%u total=%u",
+           cfg->bConfigurationValue, cfg->bNumInterfaces, cfg->wTotalLength);
   if (!find_speaker_altsetting(cfg)) {
     ESP_LOGE(TAG, "No stereo PCM iso OUT alt-setting found");
     goto fail_close;
@@ -1147,6 +1287,10 @@ static void setup_device(uint8_t addr) {
     ESP_LOGI(TAG, "UAC1 set ep 0x%02x rate %lu Hz: %s", s_out_ep,
              (unsigned long)s_out_rate, esp_err_to_name(er));
   }
+  esp_err_t feedback_error = start_feedback();
+  if (feedback_error != ESP_OK)
+    ESP_LOGW(TAG, "Feedback start failed: %s",
+             esp_err_to_name(feedback_error));
 
   /* 3) Full-duplex: also claim the mic interface and run iso IN transfers, so
    * a headset that only routes USB audio during an active bidirectional call
@@ -1235,6 +1379,7 @@ fail_close:
 
 static void teardown_device(void) {
   s_streaming = false;
+  s_feedback_active = false;
   s_capturing = false;
   s_hid_active = false;
   flush_requested = true; /* playback task drops the now-stale FIFO bytes */
@@ -1244,7 +1389,17 @@ static void teardown_device(void) {
    * once s_streaming is false. usb_host_transfer_free() on an in-flight URB
    * corrupts the heap. On DEV_GONE the stack fails transfers back much
    * faster — the extra wait just makes disconnect teardown unhurried. */
-  vTaskDelay(pdMS_TO_TICKS(NUM_URBS * PACKETS_PER_URB + 10));
+  uint32_t settle_ms = NUM_URBS * PACKETS_PER_URB + 10;
+  uint32_t feedback_settle_ms = NUM_FEEDBACK_URBS * s_feedback_interval_ms + 10;
+  if (feedback_settle_ms > settle_ms)
+    settle_ms = feedback_settle_ms;
+  vTaskDelay(pdMS_TO_TICKS(settle_ms));
+  for (int i = 0; i < NUM_FEEDBACK_URBS; i++) {
+    if (s_feedback_urb[i]) {
+      usb_host_transfer_free(s_feedback_urb[i]);
+      s_feedback_urb[i] = NULL;
+    }
+  }
   for (int i = 0; i < NUM_URBS; i++) {
     if (s_urb[i]) {
       usb_host_transfer_free(s_urb[i]);
@@ -1425,7 +1580,7 @@ static int expand_pcm(const int16_t *src, int n16, uint8_t *dst, int subslot) {
   int shift = 8 * (subslot - 2);
   uint8_t *o = dst;
   for (int i = 0; i < n16; i++) {
-    int32_t v = (int32_t)src[i] << shift;
+    uint32_t v = (uint32_t)(int32_t)src[i] << shift;
     for (int b = 0; b < subslot; b++)
       *o++ = (uint8_t)(v >> (8 * b));
   }
@@ -1592,4 +1747,32 @@ uint32_t audio_output_get_hardware_latency_us(void) {
                                 (s_out_rate * (uint32_t)s_frame_bytes));
   uint32_t urb_us = (uint32_t)NUM_URBS * PACKETS_PER_URB * 1000;
   return fifo_us + urb_us;
+}
+
+bool audio_output_get_pipeline_us(int64_t *now_us, uint32_t *pipeline_us) {
+  if (!now_us || !pipeline_us || !s_streaming || !s_out_rate)
+    return false;
+  for (int attempt = 0; attempt < 8; attempt++) {
+    uint32_t before = __atomic_load_n(&s_out_timing_seq, __ATOMIC_ACQUIRE);
+    if (!before || (before & 1U))
+      continue;
+    int64_t now = esp_timer_get_time();
+    uint32_t queued_bytes = (uint32_t)fifo_level();
+    uint32_t completed_us =
+        __atomic_load_n(&s_last_out_done_us, __ATOMIC_RELAXED);
+    uint32_t after = __atomic_load_n(&s_out_timing_seq, __ATOMIC_ACQUIRE);
+    if (before != after)
+      continue;
+
+    uint32_t in_flight_us = NUM_URBS * PACKETS_PER_URB * 1000U;
+    uint32_t elapsed_us = (uint32_t)now - completed_us;
+    if (elapsed_us >= in_flight_us)
+      return false;
+    uint32_t fifo_us = (uint32_t)((uint64_t)queued_bytes * 1000000ULL /
+                                  (s_out_rate * (uint32_t)s_frame_bytes));
+    *now_us = now;
+    *pipeline_us = fifo_us + in_flight_us - elapsed_us;
+    return true;
+  }
+  return false;
 }
