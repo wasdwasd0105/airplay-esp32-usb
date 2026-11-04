@@ -1,0 +1,5 @@
+# TOPPING E1x2 OTG connected directly to the ESP32-S3 USB port.
+# IDF 5.5.3's external-hub probe can loop while scanning this device's
+# configuration descriptor. Direct attachment does not need hub support.
+CONFIG_USB_HOST_HUBS_SUPPORTED=n
+CONFIG_USB_HOST_HUB_MULTI_LEVEL=n
