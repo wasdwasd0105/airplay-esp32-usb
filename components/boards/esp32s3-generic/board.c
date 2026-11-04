@@ -89,7 +89,8 @@ esp_err_t iot_board_init(void) {
   };
   esp_err_t bus_err = i2c_new_master_bus(&cfg, &s_display_bus);
   if (bus_err != ESP_OK) {
-    ESP_LOGE(TAG, "Display I2C initialization failed: %s", esp_err_to_name(bus_err));
+    ESP_LOGE(TAG, "Display I2C initialization failed: %s",
+             esp_err_to_name(bus_err));
     return bus_err;
   }
 #endif
