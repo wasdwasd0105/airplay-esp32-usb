@@ -29,9 +29,10 @@ typedef struct __attribute__((packed)) {
 } timing_packet_t;
 
 // Number of measurements to keep for stability
-#define TIMING_HISTORY_SIZE 8
-#define MIN_MEASUREMENTS    3
-#define TIMING_INTERVAL_MS  3000 // Send request every 3 seconds
+#define TIMING_HISTORY_SIZE        8
+#define MIN_MEASUREMENTS           3
+#define TIMING_STARTUP_INTERVAL_MS 100  // Collect initial measurements promptly
+#define TIMING_INTERVAL_MS         3000 // Steady-state request interval
 
 #define NTP_STACK_SIZE 3072
 
@@ -183,16 +184,20 @@ static void ntp_task(void *pvParameters) {
   socklen_t addr_len;
 
   // Initial delay before first request
-  vTaskDelay(pdMS_TO_TICKS(300));
+  vTaskDelay(pdMS_TO_TICKS(50));
 
   TickType_t last_request = 0;
+  bool first_request = true;
 
   while (ntp.running) {
-    // Send timing request periodically
+    // Acquire three measurements quickly, then return to the normal interval.
     TickType_t now = xTaskGetTickCount();
-    if (now - last_request >= pdMS_TO_TICKS(TIMING_INTERVAL_MS)) {
+    TickType_t interval = pdMS_TO_TICKS(
+        ntp.locked ? TIMING_INTERVAL_MS : TIMING_STARTUP_INTERVAL_MS);
+    if (first_request || now - last_request >= interval) {
       send_timing_request();
       last_request = now;
+      first_request = false;
     }
 
     // Check for response (with short timeout)
